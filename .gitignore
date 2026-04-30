@@ -4,3 +4,5 @@
 *.Rproj
 rsconnect/
 .DS_Store
+cf-workers/**/.wrangler/
+cf-workers/**/node_modules/
