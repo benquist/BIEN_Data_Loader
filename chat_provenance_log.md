@@ -248,14 +248,6 @@
 **Commit:** 48f7601
 **Deployed:** https://benquist.shinyapps.io/bien-data-loader/
 
-## 2026-04-26 — BIEN_Data_Loader README deep rewrite with step-by-step examples
-
-**Prompt:** Detailed, specific, in-the-weeds BIEN_Data_Loader README rewrite with step-by-step instructions and concrete examples.
-
-**Summary:** Rewrote the BIEN_Data_Loader README into an operational tutorial with explicit end-to-end workflow steps, command-level guidance, and concrete example inputs/outputs for real usage.
-
-**Commit/Push:** 40b65c2 pushed to origin/main.
-
 ---
 
 ## 2026-04-23 — Fix silent TNRS/GNRS/GVS/NSR button failures + raise timeouts
@@ -312,3 +304,71 @@
 - Existing download buttons, in-app action buttons, upload inputs, and status outputs kept unchanged
 
 **Validation:** `Rscript -e "parse(file='app.R'); cat('SYNTAX OK\\n')"` returned `SYNTAX OK`.
+
+## 2026-04-29 — Guided step-flow UX refinement (Scandinavian direction)
+
+**Prompt:** Improve user guidance through BIEN Data Loader tabs: explicit Step 1 handoff to Tab 2 with rationale, stronger Tab 2 mapping instructions, dropdown-only approved Darwin Core/BIEN mapping choices, Step 2 modal handoff to Tab 3, and continued next-step guidance to Tab 4 without changing core data logic.
+
+**Summary:**
+- Added Step 1 completion modal with rationale and CTA navigation to `2 • Map Fields`.
+- Strengthened Tab 2 instruction copy and mapping caption to emphasize dropdown-only approved terms (no free-typed BIEN/DWC strings).
+- Kept Step 2 completion modal and added direct CTA navigation to `3 • Stage & Validate`.
+- Consolidated Step 3 completion path to a single canonical modal/observer flow and explicit export handoff to `4 • Export`.
+- Preserved core processing behavior; parse checks passed.
+
+## 2026-04-29 — Port Approach B plot/verbatim features from BIENDataLoader-Beta (commit c49c4ec)
+- Added `verbatim_scientific_name` to `BIEN_STAGING_FIELDS` and 17 plot/individual/topography fields (cover, cover_total, relative_cover, individual_count, stem_count, plot_area_ha, plot_size_m2, basal_area_m2ha, height_m, dbh_cm, stratum, subplot, slope, aspect, topographic_position).
+- Renamed beta's `subplot_name` to BIEN-canonical `subplot` throughout (field defs, category, alias map). Aliases now map `subplot_name`, `sub_plot`, `quadrat_id` -> `subplot`.
+- Added two BIEN-canonical fields beta omitted: `coord_uncertainty_m` (Plot Structure) and `sampling_protocol` (Provenance), with definitions sourced from BIEN plot view (view_full_occurrence_individual).
+- Added `BIEN_FIELD_DEFS` and `BIEN_FIELD_CATEGORY` constants. Extension fields (not in BIEN view) are flagged with leading "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets)." in the definition string.
+- Added verbatim-name capture block in `build_staging()` so `verbatim_scientific_name` is set from source before TNRS scrubbing.
+- Added `plot_range_check()` helper plus 9 WARN-severity QC rows (cover, cover_total, relative_cover, slope, aspect, dbh_cm, height_m, plot_area_ha, individual_count); fires only when field is populated.
+- Added BIEN Staging Field Reference DT to Help tab (`output$help_field_ref` + UI block before About).
+- Did NOT port: orange BETA badge, beta banner copy, Step 1/2/3 guidance (already in main from c0c3cf9).
+- Parse: PASS (`Rscript -e "invisible(parse(file='app.R')); cat('PARSE_OK\n')"`).
+
+## 2026-04-29 — Scandinavian typography & spacing refresh (UX-only CSS pass)
+- File: app.R
+- Replaced the entire `tags$style(HTML(...))` block in `header = tagList(tags$head(...))` with a refreshed Scandinavian-style stylesheet:
+  - New `:root` token palette (--bien-blue/-deep, --bien-green/-deep, warm earthen --bien-warm-bg/--bien-surface/--bien-line/--bien-ink/--bien-muted, plus --bien-warn-/-pass-/-block- bg/line tokens).
+  - `html { font-size:16px }`, Inter system stack, 1.55 line-height, warm background.
+  - `.container-fluid` clamped to 960–1240px, 32px gutters.
+  - Page header on warm surface with 2.25rem title, muted lede; `.bien-logo` 56px.
+  - Navbar tabs 16px×22px padding, 1rem 500-weight, no text-shadow, green underline on active.
+  - Wells: surface fill, 22px padding, no shadow; standardized label/help typography.
+  - Inputs: `.shiny-input-container` 14px bottom margin, `.form-control` 0.95rem.
+  - `.bl-card` and pass/warn/block variants moved to earthen tones with 4px accent border and no shadow.
+  - `.step-badge` 30px circle, 1rem 600-weight; `.step-done` uses --bien-green-deep.
+  - QC severity classes restyled to earthen tones (PASS green-deep, WARN #a07514, BLOCK #9c4a34).
+  - Tab-content typography: h2/h3/h4, `.tab-content p`/`li`, `.tab-content small` & `.help-text`.
+  - `hr` standardized to `--bien-line` 1px, 18px vertical margin.
+  - Buttons sized to 0.95rem with 8×16 padding, 4px radius; focus ring is now 2px solid --bien-green.
+  - DT tables: 0.92rem with surface header background and 2px header bottom border.
+  - Modal styling: surface, soft shadow, padded header/body/footer, 1.25rem title.
+  - Mobile @media (≤768px): 15px root, tighter container padding, 1.6rem H1, compact navbar tabs.
+  - Preserved all existing `#cold-overlay`, `.bien-header-brand`, navbar gradient brand, hidden navbar-brand, and focus-visible behavior.
+- Inline-style pass (Step 3 BIEN Web Services sidebar + Help tab):
+  - 5 `tags$p(style="font-size:0.8em…")` / `0.85em` paragraphs in Step 3 → `class="help-text", style="margin:6px 0 10px;"`.
+  - 4 Step-3 download buttons → removed `font-size:0.85em`, bottom margin set to 10px.
+  - 4 Step-3 `tags$hr(style="margin:6px 0;")` → `margin:14px 0;`.
+  - 4 sidebar `tags$hr(style="margin:8px 0")` (Tab 1 ×2, Tab 4 ×2) → `margin:14px 0`.
+  - Help-tab section `tags$h3` headers (CSV File Format, What This App Does, Four-Step Workflow, Scientific Caveats, Technical Notes, BIEN Staging Field Reference, About) → inline style removed so global `h3` rule applies.
+  - Help-tab intro paragraph (`font-size:0.9rem; color:#555; margin-bottom:12px;`) → `class="help-text", style="margin-bottom:14px;"`.
+  - Help-tab bl-card paragraph styles (`margin:8px 0 6px 0; font-size:0.88rem; color:#3a3a3a; line-height:1.6;`) → `style = "margin:10px 0;"` (×2).
+  - Help-tab "Example…" small `tags$p` (`margin:4px 0 4px 0; font-size:0.82rem; color:#555;`) → `class="help-text", style="margin:6px 0;"` (×2).
+  - Help-tab "BIEN Staging Field Reference" intro paragraph → `class="help-text", style="margin-bottom:12px;"`.
+- Validation: `Rscript -e "invisible(parse(file='app.R'))"` printed `PARSE_OK`.
+- No logic touched: no observers, server callbacks, reactive expressions, field lists, mappings, modals, or QC behavior were modified. Only the CSS stylesheet block and inline `style=`/`class=` attributes on a small set of presentational tags were changed.
+
+## 2026-04-29 — Tab 3 sidebar stepper + tabset overflow + per-service guidance modals
+- UI-only restructure of Tab 3 (Stage & Validate) in `app.R`:
+  - Right pane: shortened inner tabset labels (Staging, Darwin Core, QC, TNRS, GNRS, GVS, NSR), wrapped in `.stage-tabs-wrap` with horizontal-scroll CSS and right-edge fade.
+  - Left pane: split into compact "QC Summary" card (now containing `qc_summary_ui`) and a `.service-stepper` `tabsetPanel(type="pills")` with one panel per BIEN service (TNRS / GNRS / GVS / NSR). Each panel contains its own orange `Try in app` CTA, download-script button, upload input, status output, and one-line description.
+- Added CSS rules for `.stage-tabs-wrap` and `.service-stepper` / `.service-panel` (placed before existing `@media (max-width: 768px)` block).
+- Added `rv$tab3_intro_seen` and `rv$svc_seen` flags plus two one-shot `showModal` observers (Tab 3 intro on landing, per-service nudge on first pill open).
+- No changes to: existing service action observers (`btn_tnrs/gnrs/gvs/nsr`), upload observers, download handlers, Step 1/2/3 completion modals, QC code, field lists, mapping table, or sanitizer.
+- All 4 service buttons, 4 download buttons, 4 upload inputs, and 4 status outputs retain unchanged IDs.
+- `Rscript -e "invisible(parse(file='app.R'))"` prints PARSE_OK.
+
+## 2026-04-29 — Header GitHub + README links
+- Added two right-aligned links in the page header: GitHub repo (https://github.com/benquist/BIEN_Data_Loader) and README. Each uses an inline SVG icon (no external asset). New `.bien-header-links` and `.header-link` CSS rules. UI-only; no server logic touched. Parse OK.

@@ -3,6 +3,9 @@ library(DT)
 library(httr)
 library(jsonlite)
 
+# Allow larger uploads on shinyapps while keeping in-app warnings for large files.
+options(shiny.maxRequestSize = 100 * 1024^2)
+
 # ── Cloudflare Worker relay URLs (replace YOUR_SUBDOMAIN with your workers.dev account name) ──
 TNRS_URL <- "https://bien-relay-tnrs.benquist.workers.dev"
 GNRS_URL <- "https://bien-relay-gnrs.benquist.workers.dev"
@@ -20,6 +23,8 @@ BIEN_STAGING_FIELDS <- c(
   # Taxonomy — populated by TNRS (scrubbed_* fields from BIEN DB view_full_occurrence_individual)
   "scrubbed_species_binomial", "scrubbed_family", "scrubbed_genus",
   "scrubbed_author", "scrubbed_taxonomic_status",
+  # Verbatim name — captured before TNRS scrubbing; intentionally NOT overwritten by TNRS
+  "verbatim_scientific_name",
   # Coordinates
   "latitude", "longitude",
   # GVS coordinate QA — BIEN DB field is_centroid (filtered: WHERE is_centroid IS NULL OR is_centroid=0)
@@ -40,7 +45,135 @@ BIEN_STAGING_FIELDS <- c(
   "is_cultivated_observation",
   # Verbatim / elevation
   "verbatimLocality", "verbatimElevation",
-  "elevation_min", "elevation_max"
+  "elevation_min", "elevation_max",
+  # ── Plot Structure (vegetation survey fields; canonical BIEN plot view: plot_area_ha, subplot, individual_count, coord_uncertainty_m, sampling_protocol) ──
+  "cover",                # Percent cover of taxon in plot (0–100) — extension field
+  "cover_total",          # Total vegetation cover in plot (0–100; stand-level) — extension field
+  "relative_cover",       # Cover of taxon relative to all taxa in plot (0–100) — extension field
+  "individual_count",     # BIEN plot view: number of individuals of the taxon in plot
+  "stem_count",           # Number of stems counted (clonal taxa) — extension field
+  "plot_area_ha",         # BIEN plot view: plot surveyed area in hectares
+  "plot_size_m2",         # Plot area in m² (pass-through; convert to ha for BIEN ingest) — extension field
+  "basal_area_m2ha",      # Stand basal area in m²/ha (plot-level aggregate) — extension field
+  "coord_uncertainty_m",  # BIEN plot view: coordinate uncertainty in meters
+  "sampling_protocol",    # BIEN plot view: sampling protocol / methodology
+  # ── Individual Plant Metrics ──────────────────────────────────────────────
+  "height_m",             # Plant height in meters — extension field
+  "dbh_cm",               # Diameter at breast height (1.3 m) in cm — extension field
+  "stratum",              # Vertical stratum: canopy/subcanopy/shrub/herb/ground — extension field
+  "subplot",              # BIEN plot view: subplot or sub-quadrat identifier within the main plot
+  # ── Topography ────────────────────────────────────────────────────────────
+  "slope",                # Slope in degrees (0=flat, 90=vertical) — extension field
+  "aspect",               # Aspect in degrees clockwise from N — extension field
+  "topographic_position"  # Qualitative: ridge/upper slope/mid slope/lower slope/valley — extension field
+)
+
+# ── BIEN Field Definitions (Help tab reference table) ────────────────────────
+BIEN_FIELD_DEFS <- c(
+  scrubbed_species_binomial    = "Accepted species binomial after TNRS name-scrubbing (BIEN DB: scrubbed_species_binomial)",
+  verbatim_scientific_name     = "Original species name as submitted, before any TNRS correction. Never overwritten.",
+  scrubbed_family              = "Accepted family name after TNRS scrubbing",
+  scrubbed_genus               = "Accepted genus after TNRS scrubbing",
+  scrubbed_author              = "Authorship of the accepted name from TNRS",
+  scrubbed_taxonomic_status    = "TNRS taxonomic status: accepted, synonym, etc.",
+  latitude                     = "Decimal latitude in WGS84. Must be in [-90, 90]. Negative = south.",
+  longitude                    = "Decimal longitude in WGS84. Must be in [-180, 180]. Negative = west.",
+  is_centroid                  = "GVS centroid flag: 1 = coordinate matches a political centroid; 0 = checked, not centroid; blank = not checked.",
+  date_collected               = "Collection or observation date. Accepts common date formats (YYYY-MM-DD preferred).",
+  dataset                      = "Dataset or project name this record belongs to.",
+  datasource                   = "Source institution or data repository.",
+  dataowner                    = "Person or organization owning the dataset; often the lead collector.",
+  collection_code              = "Voucher, herbarium, or catalog number for the record.",
+  locality                     = "Textual description of the collection locality.",
+  country                      = "Country name (standardized by GNRS).",
+  state_province               = "State or province name (standardized by GNRS).",
+  county                       = "County or parish name (standardized by GNRS).",
+  plot_name                    = "Plot or site identifier. Used to link observations to plot metadata.",
+  occurrenceID                 = "Globally unique identifier for the occurrence record (Darwin Core).",
+  basisOfRecord                = "Nature of the record: HumanObservation, PreservedSpecimen, etc.",
+  native_status                = "NSR native status: N=native, I=introduced, NI=native+introduced, UNK=unknown.",
+  native_status_reason         = "Basis for NSR native status assignment.",
+  native_status_country        = "Country used to evaluate native status.",
+  native_status_state_province = "State/province used to evaluate native status.",
+  native_status_county_parish  = "County/parish used to evaluate native status.",
+  is_introduced                = "1 if taxon is introduced in the specified region; 0 if not.",
+  is_cultivated_observation    = "1 if this record represents a cultivated individual; generally excluded from range/SDM analyses.",
+  verbatimLocality             = "Verbatim locality string as recorded in the field (not standardized).",
+  verbatimElevation            = "Verbatim elevation as recorded in the field (not converted).",
+  elevation_min                = "Minimum elevation of the collection locality in meters.",
+  elevation_max                = "Maximum elevation of the collection locality in meters.",
+  # Plot structure
+  cover                        = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Percent cover of the taxon within the plot (0-100).",
+  cover_total                  = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Total vegetation cover in the plot (0-100); stand-level aggregate.",
+  relative_cover               = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Cover of the taxon relative to all taxa in the plot (0-100).",
+  individual_count             = "BIEN plot view (view_full_occurrence_individual): number of individuals of the taxon recorded in the plot.",
+  stem_count                   = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Number of stems counted (may differ from individual_count for clonal taxa).",
+  plot_area_ha                 = "BIEN plot view (view_full_occurrence_individual): plot surveyed area in hectares (preferred BIEN unit).",
+  plot_size_m2                 = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Plot area in square meters; convert to ha for BIEN ingest.",
+  basal_area_m2ha              = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Stand basal area in m2/ha (plot-level aggregate, not per-taxon).",
+  coord_uncertainty_m          = "BIEN plot view (view_full_occurrence_individual): coordinate uncertainty in meters around the reported lat/lon.",
+  sampling_protocol            = "BIEN plot view (view_full_occurrence_individual): sampling protocol or methodology used for the plot survey.",
+  # Individual plant metrics
+  height_m                     = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Plant height in meters.",
+  dbh_cm                       = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Diameter at breast height (measured at 1.3 m above ground) in centimeters.",
+  stratum                      = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Vertical stratum of the individual: canopy, subcanopy, shrub, herb, or ground.",
+  subplot                      = "BIEN plot view (view_full_occurrence_individual): subplot or sub-quadrat identifier within the main plot.",
+  # Topography
+  slope                        = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Terrain slope in degrees from horizontal (0 = flat, 90 = vertical cliff).",
+  aspect                       = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Terrain aspect in degrees clockwise from north (0/360=N, 90=E, 180=S, 270=W).",
+  topographic_position         = "Extension field (not in BIEN view_full_occurrence_individual; preserved as pass-through for plot/community datasets). Qualitative topographic position: ridge, upper slope, mid slope, lower slope, or valley."
+)
+
+BIEN_FIELD_CATEGORY <- c(
+  scrubbed_species_binomial    = "Taxonomy",
+  verbatim_scientific_name     = "Taxonomy",
+  scrubbed_family              = "Taxonomy",
+  scrubbed_genus               = "Taxonomy",
+  scrubbed_author              = "Taxonomy",
+  scrubbed_taxonomic_status    = "Taxonomy",
+  latitude                     = "Coordinates",
+  longitude                    = "Coordinates",
+  is_centroid                  = "Coordinates",
+  date_collected               = "Temporal",
+  dataset                      = "Provenance",
+  datasource                   = "Provenance",
+  dataowner                    = "Provenance",
+  collection_code              = "Provenance",
+  sampling_protocol            = "Provenance",
+  locality                     = "Geography",
+  country                      = "Geography",
+  state_province               = "Geography",
+  county                       = "Geography",
+  plot_name                    = "Geography",
+  occurrenceID                 = "Identifiers",
+  basisOfRecord                = "Identifiers",
+  native_status                = "NSR Status",
+  native_status_reason         = "NSR Status",
+  native_status_country        = "NSR Status",
+  native_status_state_province = "NSR Status",
+  native_status_county_parish  = "NSR Status",
+  is_introduced                = "NSR Status",
+  is_cultivated_observation    = "NSR Status",
+  verbatimLocality             = "Verbatim",
+  verbatimElevation            = "Verbatim",
+  elevation_min                = "Elevation",
+  elevation_max                = "Elevation",
+  cover                        = "Plot Structure",
+  cover_total                  = "Plot Structure",
+  relative_cover               = "Plot Structure",
+  individual_count             = "Plot Structure",
+  stem_count                   = "Plot Structure",
+  plot_area_ha                 = "Plot Structure",
+  plot_size_m2                 = "Plot Structure",
+  basal_area_m2ha              = "Plot Structure",
+  coord_uncertainty_m          = "Plot Structure",
+  height_m                     = "Plant Metrics",
+  dbh_cm                       = "Plant Metrics",
+  stratum                      = "Plant Metrics",
+  subplot                      = "Plant Metrics",
+  slope                        = "Topography",
+  aspect                       = "Topography",
+  topographic_position         = "Topography"
 )
 
 DWC_TERMS <- c(
@@ -58,6 +191,63 @@ DWC_TERMS <- c(
 
 canonicalize <- function(x) {
   gsub("_+", "_", gsub("[^a-z0-9]+", "_", tolower(trimws(as.character(x)))))
+}
+
+blank_row_filter <- function(df) {
+  if (nrow(df) == 0L || ncol(df) == 0L) return(df)
+  not_blank <- Reduce(`|`, lapply(df, function(col) {
+    s <- trimws(as.character(col))
+    !is.na(col) & nzchar(s) & s != "NA"
+  }))
+  df[not_blank, , drop = FALSE]
+}
+
+safe_read_csv_with_fallbacks <- function(path, file_label = basename(path)) {
+  sniffed_sep <- tryCatch({
+    hdr <- readLines(path, n = 1L, warn = FALSE, encoding = "UTF-8")
+    n_comma <- nchar(hdr) - nchar(gsub(",", "", hdr, fixed = TRUE))
+    n_semi  <- nchar(hdr) - nchar(gsub(";", "", hdr, fixed = TRUE))
+    if (n_semi > n_comma) ";" else ","
+  }, error = function(e) NULL)
+
+  sep_candidates <- if (!is.null(sniffed_sep))
+    c(sniffed_sep, setdiff(c(",", ";"), sniffed_sep))
+  else c(",", ";")
+
+  attempts <- expand.grid(
+    sep          = sep_candidates,
+    fileEncoding = c("UTF-8", "latin1"),
+    stringsAsFactors = FALSE
+  )
+  errors <- character(0)
+
+  for (i in seq_len(nrow(attempts))) {
+    sep_i <- attempts$sep[i]
+    enc_i <- attempts$fileEncoding[i]
+    res <- tryCatch(
+      utils::read.csv(path, stringsAsFactors = FALSE, check.names = FALSE,
+                      sep = sep_i, fileEncoding = enc_i),
+      error = function(e) e
+    )
+
+    if (!inherits(res, "error")) {
+      if (ncol(res) == 1L) {
+        hdr <- names(res)[1]
+        wrong_sep <- (sep_i == "," && grepl(";", hdr, fixed = TRUE)) ||
+                     (sep_i == ";" && grepl(",", hdr, fixed = TRUE))
+        if (isTRUE(wrong_sep)) {
+          errors <- c(errors, paste0("sep='", sep_i, "', enc=", enc_i, ": one-column parse"))
+          next
+        }
+      }
+      return(res)
+    }
+
+errors <- c(errors, paste0("sep='", sep_i, "', enc=", enc_i, ": ", conditionMessage(res)))
+  }
+
+  stop(paste0("Could not read '", file_label, "'. Tried comma/semicolon separators and UTF-8/Latin-1. Errors: ",
+              paste(errors, collapse = " | ")), call. = FALSE)
 }
 
 # ── Mapping lookup tables (built once at load time) ───────────────────────────
@@ -119,7 +309,38 @@ BIEN_ALIASES <- c(
   transect = "plot_name", station = "plot_name", quadrat = "plot_name",
   voucher = "collection_code", voucher_number = "collection_code",
   catalog_number = "collection_code", specimen_id = "collection_code",
-  locality_description = "verbatimLocality", habitat_notes = "verbatimLocality"
+  locality_description = "verbatimLocality", habitat_notes = "verbatimLocality",
+  # ── Verbatim name aliases ─────────────────────────────────────────────────
+  verbatim_name = "verbatim_scientific_name", verbatim_species = "verbatim_scientific_name",
+  original_name = "verbatim_scientific_name", submitted_name = "verbatim_scientific_name",
+  # ── Plot structure aliases ────────────────────────────────────────────────
+  cover_pct = "cover", pct_cover = "cover", percent_cover = "cover", pct_cov = "cover",
+  cover_total_pct = "cover_total", total_cover = "cover_total",
+  rel_cover = "relative_cover", relative_abundance = "relative_cover",
+  n_individuals = "individual_count", count = "individual_count",
+  abundance_count = "individual_count", ind_count = "individual_count",
+  n_stems = "stem_count", stems = "stem_count", stem_number = "stem_count",
+  area_ha = "plot_area_ha", plot_area = "plot_area_ha", survey_area_ha = "plot_area_ha",
+  plot_size = "plot_size_m2", quadrat_size_m2 = "plot_size_m2",
+  subplot_size_m2 = "plot_size_m2", area_m2 = "plot_size_m2",
+  ba_m2ha = "basal_area_m2ha", stand_ba = "basal_area_m2ha",
+  basal_area = "basal_area_m2ha",
+  coord_uncertainty = "coord_uncertainty_m", coordinate_uncertainty_m = "coord_uncertainty_m",
+  coordinateuncertaintyinmeters = "coord_uncertainty_m",
+  protocol = "sampling_protocol", method = "sampling_protocol",
+  samplingprotocol = "sampling_protocol", survey_method = "sampling_protocol",
+  # ── Individual plant metric aliases ───────────────────────────────────────
+  ht_m = "height_m", plant_height = "height_m", height = "height_m",
+  canopy_height_m = "height_m", tree_height_m = "height_m",
+  dbh = "dbh_cm", stem_diameter_cm = "dbh_cm", diameter_cm = "dbh_cm",
+  layer = "stratum", canopy_layer = "stratum", vegetation_layer = "stratum",
+  subplot_name = "subplot", sub_plot = "subplot", quadrat_id = "subplot",
+  # ── Topography aliases ────────────────────────────────────────────────────
+  slope_deg = "slope", terrain_slope = "slope", slope_degrees = "slope",
+  aspect_deg = "aspect", terrain_aspect = "aspect", exposure = "aspect",
+  aspect_degrees = "aspect",
+  topo = "topographic_position", topo_position = "topographic_position",
+  position = "topographic_position", landform = "topographic_position"
 )
 
 # ── Vectorized auto-suggest ───────────────────────────────────────────────────
@@ -160,6 +381,15 @@ build_staging <- function(merged_df, mapping) {
     fld <- m$bien_field[i]
     if (src %in% names(merged_df) && fld %in% BIEN_STAGING_FIELDS) {
       staged[[fld]] <- as.character(merged_df[[src]])
+    }
+  }
+
+  # ── Capture verbatim_scientific_name before TNRS can overwrite scrubbed name ──
+  # verbatim_scientific_name is intentionally NOT overwritten by TNRS
+  if (all(is.na(staged$verbatim_scientific_name) | staged$verbatim_scientific_name == "")) {
+    spp_row <- m[m$bien_field == "scrubbed_species_binomial", , drop=FALSE]
+    if (nrow(spp_row) > 0 && spp_row$source_col[1] %in% names(merged_df)) {
+      staged$verbatim_scientific_name <- as.character(merged_df[[spp_row$source_col[1]]])
     }
   }
 
@@ -246,6 +476,34 @@ run_qc <- function(staged) {
     }
   }
 
+  # ── Plot field range QC (only fires for rows where field is populated) ──
+  plot_range_check <- function(label, field, lo, hi, sev_fail) {
+    if (!field %in% names(staged)) return(NULL)
+    vals <- as.character(staged[[field]])
+    populated <- !is.na(vals) & trimws(vals) != ""
+    n_pop <- sum(populated)
+    if (n_pop == 0) return(NULL)  # field not populated — skip silently
+    n_vals <- suppressWarnings(as.numeric(vals[populated]))
+    pass_populated <- !is.na(n_vals) & n_vals >= lo & n_vals <= hi
+    n_pass <- sum(pass_populated)
+    n_fail <- n_pop - n_pass
+    ex_fail <- vals[populated][which(!pass_populated)[1]]
+    data.frame(field=field, check=label,
+               n_records=n_pop, n_pass=n_pass, n_fail=n_fail,
+               severity=if(n_fail==0) "PASS" else sev_fail,
+               example_fail=if(is.na(ex_fail)) NA_character_ else ex_fail,
+               stringsAsFactors=FALSE)
+  }
+  rows[["cover"]]       <- plot_range_check("Cover in range [0, 100] %",           "cover",        0, 100, "WARN")
+  rows[["cover_tot"]]   <- plot_range_check("Cover total in range [0, 100] %",      "cover_total",  0, 100, "WARN")
+  rows[["rel_cover"]]   <- plot_range_check("Relative cover in range [0, 100] %",   "relative_cover", 0, 100, "WARN")
+  rows[["slope_qc"]]    <- plot_range_check("Slope in range [0, 90] degrees",        "slope",        0,  90, "WARN")
+  rows[["aspect_qc"]]   <- plot_range_check("Aspect in range [0, 360] degrees",      "aspect",       0, 360, "WARN")
+  rows[["dbh_qc"]]      <- plot_range_check("DBH non-negative (>= 0 cm)",            "dbh_cm",       0, 1e4, "WARN")
+  rows[["height_qc"]]   <- plot_range_check("Height non-negative (>= 0 m)",          "height_m",     0, 200, "WARN")
+  rows[["plotarea_qc"]] <- plot_range_check("Plot area non-negative (>= 0 ha)",       "plot_area_ha", 0, 1e6, "WARN")
+  rows[["ind_cnt_qc"]]  <- plot_range_check("Individual count non-negative (>= 0)",  "individual_count", 0, 1e6, "WARN")
+
   qc <- do.call(rbind, Filter(Negate(is.null), rows))
   if (!is.null(qc)) row.names(qc) <- NULL
   qc
@@ -260,21 +518,38 @@ ui <- navbarPage(
     tags$head(
       tags$style(HTML("
         :root {
-          --bien-blue: #2f79b7;
-          --bien-blue-deep: #1f5b8f;
-          --bien-green: #74b64a;
-          --bien-green-deep: #4e8c2c;
-          --bien-sky: #e9f4ff;
-          --bien-mint: #eef9e8;
-          --panel-border: #cfe2f3;
-          --text-ink: #24445f;
+          --bien-blue:#2f79b7;
+          --bien-blue-deep:#1f5b8f;
+          --bien-green:#5b8a4c;
+          --bien-green-deep:#46703b;
+          --bien-warm-bg:#f7f4ee;
+          --bien-surface:#fffdf8;
+          --bien-line:#e6dfd2;
+          --bien-ink:#1f3344;
+          --bien-muted:#5a6e7e;
+          --bien-warn-bg:#fbf3df;
+          --bien-warn-line:#d8c281;
+          --bien-pass-bg:#eaf2dd;
+          --bien-pass-line:#b3c98d;
+          --bien-block-bg:#f8e2db;
+          --bien-block-line:#c98a76;
         }
 
+        html { font-size: 16px; }
         body {
+          font-family: Inter, system-ui, -apple-system, \"Segoe UI\", Arial, sans-serif;
+          color: var(--bien-ink);
+          background: var(--bien-warm-bg);
+          line-height: 1.55;
           padding: 0;
-          font-family: 'Segoe UI', Arial, sans-serif;
-          color: var(--text-ink);
-          background: linear-gradient(180deg, #f7fbff 0%, #fbfef9 100%);
+        }
+
+        .container-fluid,
+        .navbar > .container-fluid {
+          max-width: clamp(960px, 92vw, 1240px);
+          margin: 0 auto;
+          padding-left: 32px;
+          padding-right: 32px;
         }
 
         .navbar {
@@ -300,43 +575,10 @@ ui <- navbarPage(
           flex: 0 0 auto;
         }
         .navbar-nav > li > a {
-          padding: 14px 20px !important;
-          font-size: 0.95em !important;
+          padding: 16px 22px !important;
+          font-size: 1rem !important;
           font-weight: 500 !important;
-          letter-spacing: 0.02em;
-        }
-        .page-header {
-          padding: 20px 24px;
-          background: linear-gradient(180deg, #ffffff 0%, #f2f9ff 100%);
-          border-bottom: 1px solid var(--panel-border);
-          margin: 0;
-          box-shadow: none;
-        }
-        .bien-header-brand {
-          display: flex;
-          align-items: center;
-          gap: 16px;
-          flex-wrap: wrap;
-        }
-        .bien-logo {
-          height: 62px;
-          width: auto;
-          filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.12));
-        }
-        .page-header h1 {
-          color: var(--bien-blue-deep);
-          font-size: 2em;
-          font-weight: 700;
-          line-height: 1.2;
-          margin-top: 0;
-          margin-bottom: 8px;
-        }
-        .page-header p {
-          color: #426988;
-          font-size: 1.05em;
-          line-height: 1.4;
-          margin-bottom: 0;
-          max-width: 920px;
+          letter-spacing: 0.01em;
         }
         .navbar-brand, .navbar-nav > li > a {
           color: #ffffff !important;
@@ -358,12 +600,74 @@ ui <- navbarPage(
           font-weight: 600;
         }
 
+        .page-header {
+          padding: 28px 32px;
+          background: var(--bien-surface);
+          border-bottom: 1px solid var(--bien-line);
+          margin: 0;
+          box-shadow: none;
+        }
+        .bien-header-brand {
+          display: flex;
+          align-items: center;
+          gap: 16px;
+          flex-wrap: wrap;
+        }
+        .bien-header-text { flex: 1 1 auto; min-width: 260px; }
+        .bien-header-links {
+          margin-left: auto;
+          display: flex;
+          gap: 10px;
+          flex-wrap: wrap;
+          align-items: center;
+        }
+        .bien-header-links .header-link {
+          display: inline-flex;
+          align-items: center;
+          padding: 8px 14px;
+          font-size: 0.92rem;
+          font-weight: 500;
+          color: var(--bien-blue-deep);
+          background: var(--bien-warm-bg);
+          border: 1px solid var(--bien-line);
+          border-radius: 4px;
+          text-decoration: none;
+          transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+        }
+        .bien-header-links .header-link:hover,
+        .bien-header-links .header-link:focus {
+          background: var(--bien-blue-deep);
+          color: #fff;
+          border-color: var(--bien-blue-deep);
+          text-decoration: none;
+        }
+        .bien-logo {
+          height: 56px;
+          width: auto;
+          filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.12));
+        }
+        .page-header h1 {
+          font-size: 2.25rem;
+          font-weight: 600;
+          letter-spacing: -0.01em;
+          color: var(--bien-blue-deep);
+          margin: 0 0 8px;
+          line-height: 1.15;
+        }
+        .page-header p {
+          font-size: 1.05rem;
+          color: var(--bien-muted);
+          max-width: 720px;
+          margin: 0;
+          line-height: 1.5;
+        }
+
         a:focus-visible,
         button:focus-visible,
         .btn:focus-visible,
         .navbar-nav > li > a:focus-visible,
         .nav > li > a:focus-visible {
-          outline: 3px solid rgba(116, 182, 74, 0.95) !important;
+          outline: 2px solid var(--bien-green);
           outline-offset: 2px;
           border-radius: 4px;
         }
@@ -384,33 +688,124 @@ ui <- navbarPage(
         #cold-overlay p  { font-size:1.1em; color:var(--bien-blue); font-weight:600; margin:0 0 6px; }
         #cold-overlay small { color:#777; font-size:0.85em; }
 
+        /* Sidebar / wells */
+        .well {
+          background: var(--bien-surface);
+          border: 1px solid var(--bien-line);
+          border-radius: 6px;
+          box-shadow: none;
+          padding: 22px 22px;
+        }
+        .well .control-label, .well label {
+          font-size: 0.95rem;
+          font-weight: 500;
+          color: var(--bien-ink);
+        }
+        .well p, .well .help-block {
+          font-size: 0.9rem;
+          color: var(--bien-muted);
+          line-height: 1.5;
+        }
+
+        /* Inputs */
+        .shiny-input-container { margin-bottom: 14px; }
+        .form-control { font-size: 0.95rem; }
+
         /* Info cards */
         .bl-card {
-          background: linear-gradient(160deg, #ffffff 0%, #f4faff 100%);
-          border: 1px solid var(--panel-border);
+          background: var(--bien-surface);
+          border: 1px solid var(--bien-line);
           border-left: 4px solid var(--bien-blue);
-          padding:12px 16px;
-          margin:10px 0;
-          border-radius:10px;
-          box-shadow: 0 8px 18px rgba(36, 68, 95, 0.09);
+          padding: 20px 24px;
+          margin: 16px 0;
+          border-radius: 6px;
+          box-shadow: none;
+          font-size: 0.95rem;
+          line-height: 1.55;
         }
-        .bl-card-warn  { border-left-color:#e6a817; background:#fffaf0; }
-        .bl-card-block { border-left-color:#c0392b; background:#fff6f6; }
-        .bl-card-pass  { border-left-color:#27ae60; background:#f2fff6; }
+        .bl-card-warn {
+          background: var(--bien-warn-bg);
+          border-color: var(--bien-warn-line);
+          border-left-color: #b08a2a;
+        }
+        .bl-card-pass {
+          background: var(--bien-pass-bg);
+          border-color: var(--bien-pass-line);
+          border-left-color: var(--bien-green-deep);
+        }
+        .bl-card-block {
+          background: var(--bien-block-bg);
+          border-color: var(--bien-block-line);
+          border-left-color: #9c5a44;
+        }
 
         /* Step badges */
         .step-badge {
-          display:inline-block; width:28px; height:28px; border-radius:50%;
-          background:var(--bien-blue); color:#fff; font-weight:700;
-          text-align:center; line-height:28px; margin-right:8px; font-size:0.9em;
+          width: 30px;
+          height: 30px;
+          line-height: 30px;
+          font-size: 1rem;
+          font-weight: 600;
+          border-radius: 50%;
+          display: inline-block;
+          text-align: center;
+          background: var(--bien-blue);
+          color: #fff;
+          margin-right: 10px;
         }
-        .step-done { background:#27ae60; }
+        .step-done { background: var(--bien-green-deep); }
 
         /* QC severity colours in tables */
-        .qc-PASS  { color:#27ae60; font-weight:700; }
-        .qc-WARN  { color:#e6a817; font-weight:700; }
-        .qc-BLOCK { color:#c0392b; font-weight:700; }
+        .qc-PASS  { color: var(--bien-green-deep); font-weight: 600; }
+        .qc-WARN  { color: #a07514; font-weight: 600; }
+        .qc-BLOCK { color: #9c4a34; font-weight: 600; }
 
+        /* Headings inside tab content */
+        h2 {
+          font-size: 1.5rem;
+          font-weight: 600;
+          margin: 24px 0 12px;
+          color: var(--bien-ink);
+        }
+        h3 {
+          font-size: 1.15rem;
+          font-weight: 600;
+          letter-spacing: 0.01em;
+          color: var(--bien-ink);
+          margin: 20px 0 10px;
+          padding-bottom: 6px;
+          border-bottom: 1px solid var(--bien-line);
+        }
+        h4 {
+          font-size: 1rem;
+          font-weight: 600;
+          color: var(--bien-ink);
+          margin: 16px 0 8px;
+        }
+
+        /* Generic body text in tab panels */
+        .tab-content p, .tab-content li {
+          font-size: 0.95rem;
+          line-height: 1.55;
+        }
+        .tab-content small, .help-text {
+          font-size: 0.85rem;
+          color: var(--bien-muted);
+        }
+
+        hr {
+          border-color: var(--bien-line);
+          border-top-width: 1px;
+          margin: 18px 0;
+        }
+
+        /* Buttons */
+        .btn {
+          font-size: 0.95rem;
+          padding: 8px 16px;
+          border-radius: 4px;
+          font-weight: 500;
+        }
         .btn-primary {
           background: linear-gradient(180deg, var(--bien-blue) 0%, var(--bien-blue-deep) 100%);
           border-color: #194a72;
@@ -432,13 +827,156 @@ ui <- navbarPage(
           border-color: #365f1f;
         }
 
-        /* Spacing */
-        .shiny-input-container { margin-bottom:8px; }
+        /* DT tables */
+        table.dataTable { font-size: 0.92rem; }
+        table.dataTable thead th {
+          font-weight: 600;
+          background: var(--bien-surface);
+          border-bottom: 2px solid var(--bien-line);
+        }
+
+        /* Modal dialogs */
+        .modal-content {
+          border: 1px solid var(--bien-line);
+          border-radius: 6px;
+          box-shadow: 0 12px 32px rgba(31,51,68,0.18);
+        }
+        .modal-header {
+          border-bottom: 1px solid var(--bien-line);
+          padding: 20px 24px;
+        }
+        .modal-title {
+          font-size: 1.25rem;
+          font-weight: 600;
+        }
+        .modal-body {
+          padding: 24px;
+          font-size: 1rem;
+          line-height: 1.55;
+        }
+        .modal-footer {
+          border-top: 1px solid var(--bien-line);
+          padding: 16px 24px;
+        }
+
+        /* Tab 3 inner tabset: keep on one line, scroll horizontally if needed */
+        .stage-tabs-wrap { position: relative; }
+        .stage-tabs-wrap .nav-tabs {
+          flex-wrap: nowrap;
+          overflow-x: auto;
+          overflow-y: hidden;
+          -webkit-overflow-scrolling: touch;
+          scrollbar-width: thin;
+          border-bottom: 1px solid var(--bien-line);
+        }
+        .stage-tabs-wrap .nav-tabs > li { flex: 0 0 auto; }
+        .stage-tabs-wrap .nav-tabs > li > a {
+          white-space: nowrap;
+          padding: 10px 16px;
+          font-size: 0.95rem;
+          font-weight: 500;
+          color: var(--bien-muted);
+          border: none;
+          border-bottom: 2px solid transparent;
+          border-radius: 0;
+          margin-right: 0;
+        }
+        .stage-tabs-wrap .nav-tabs > li.active > a,
+        .stage-tabs-wrap .nav-tabs > li.active > a:hover,
+        .stage-tabs-wrap .nav-tabs > li.active > a:focus {
+          color: var(--bien-blue-deep);
+          background: transparent;
+          border: none;
+          border-bottom: 2px solid var(--bien-blue);
+          font-weight: 600;
+        }
+        .stage-tabs-wrap .nav-tabs > li > a:hover {
+          background: transparent;
+          color: var(--bien-ink);
+          border-bottom-color: var(--bien-line);
+        }
+        /* Soft right-edge fade hint when scrollable */
+        .stage-tabs-wrap::after {
+          content: \"\";
+          position: absolute;
+          top: 0; right: 0;
+          width: 24px; height: 42px;
+          background: linear-gradient(90deg, rgba(247,244,238,0) 0%, var(--bien-warm-bg) 100%);
+          pointer-events: none;
+        }
+
+        /* Tab 3 sidebar: compact, no-scroll vertical stepper */
+        .stage-summary-card { margin-bottom: 14px; }
+        .stage-summary-card .step-badge { margin-right: 8px; vertical-align: middle; }
+        .stage-services-card { padding-bottom: 18px; }
+        .service-stepper .nav-pills {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+          margin-bottom: 14px;
+          padding-bottom: 12px;
+          border-bottom: 1px solid var(--bien-line);
+        }
+        .service-stepper .nav-pills > li { float: none; flex: 1 1 auto; min-width: 60px; }
+        .service-stepper .nav-pills > li > a {
+          text-align: center;
+          padding: 8px 6px;
+          font-size: 0.9rem;
+          font-weight: 600;
+          color: var(--bien-muted);
+          background: var(--bien-warm-bg);
+          border: 1px solid var(--bien-line);
+          border-radius: 4px;
+          white-space: nowrap;
+        }
+        .service-stepper .nav-pills > li.active > a,
+        .service-stepper .nav-pills > li.active > a:hover,
+        .service-stepper .nav-pills > li.active > a:focus {
+          background: var(--bien-blue);
+          color: #fff;
+          border-color: var(--bien-blue-deep);
+        }
+        .service-stepper .nav-pills > li:not(.active) > a:hover {
+          background: var(--bien-surface);
+          color: var(--bien-ink);
+        }
+        .service-panel { padding-top: 4px; }
+        .service-panel .service-desc {
+          margin: 0 0 14px 0;
+          padding: 10px 12px;
+          background: var(--bien-warm-bg);
+          border-left: 3px solid var(--bien-line);
+          border-radius: 4px;
+        }
+        .service-panel .service-cta {
+          width: 100%;
+          font-size: 1rem;
+          font-weight: 600;
+          padding: 12px 16px;
+          margin-bottom: 10px;
+          background: linear-gradient(180deg, #e89a3a 0%, #d4801f 100%);
+          border-color: #b06a18;
+          color: #fff;
+        }
+        .service-panel .service-cta:hover,
+        .service-panel .service-cta:focus {
+          background: linear-gradient(180deg, #d4801f 0%, #b06a18 100%);
+          border-color: #8e5413;
+          color: #fff;
+        }
+        .service-panel .service-dl {
+          width: 100%;
+          font-size: 0.9rem;
+          margin-bottom: 12px;
+        }
+        .service-panel .shiny-input-container { margin-bottom: 10px; }
 
         @media (max-width: 768px) {
-          .bien-logo { height: 44px; }
-          .page-header h1 { font-size: 1.4em; }
-          .navbar-nav > li > a { padding: 12px 10px !important; font-size: 0.82em !important; }
+          html { font-size: 15px; }
+          .container-fluid { padding-left: 16px; padding-right: 16px; }
+          .page-header { padding: 20px 16px; }
+          .page-header h1 { font-size: 1.6rem; }
+          .navbar-nav > li > a { padding: 12px 14px !important; font-size: 0.95rem !important; }
         }
       ")),
       tags$script(HTML("
@@ -456,9 +994,19 @@ ui <- navbarPage(
     tags$div(class = "page-header",
       tags$div(class = "bien-header-brand",
         tags$img(src="bien.png", alt="BIEN logo", class="bien-logo"),
-        tags$div(
+        tags$div(class = "bien-header-text",
           tags$h1("BIEN Data Loader"),
           tags$p("Upload, validate, and export BIEN-ready records")
+        ),
+        tags$div(class = "bien-header-links",
+          tags$a(href = "https://github.com/benquist/BIEN_Data_Loader",
+                 target = "_blank", rel = "noopener noreferrer",
+                 class = "header-link",
+                 HTML('<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" style="vertical-align:-3px; margin-right:6px; fill:currentColor;"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub')),
+          tags$a(href = "https://github.com/benquist/BIEN_Data_Loader#readme",
+                 target = "_blank", rel = "noopener noreferrer",
+                 class = "header-link",
+                 HTML('<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" style="vertical-align:-3px; margin-right:6px; fill:currentColor;"><path d="M0 1.75A.75.75 0 0 1 .75 1h4.253c1.227 0 2.317.59 3 1.501A3.74 3.74 0 0 1 11.006 1h4.245a.75.75 0 0 1 .75.75v10.5a.75.75 0 0 1-.75.75h-4.507a2.25 2.25 0 0 0-1.591.659l-.622.621a.75.75 0 0 1-1.06 0l-.622-.621A2.25 2.25 0 0 0 5.258 13H.75a.75.75 0 0 1-.75-.75Zm7.251 10.324.004-5.073-.002-2.253A2.25 2.25 0 0 0 5.003 2.5H1.5v9h3.757a3.75 3.75 0 0 1 1.994.574ZM8.755 4.75l-.004 7.322a3.752 3.752 0 0 1 1.992-.572H14.5v-9h-3.495a2.25 2.25 0 0 0-2.25 2.25Z"/></svg>README'))
         )
       )
     ),
@@ -476,7 +1024,7 @@ ui <- navbarPage(
         tags$div(class="bl-card",
           tags$span(class="step-badge", "1"),
           tags$strong("Load Data"),
-          tags$hr(style="margin:8px 0"),
+          tags$hr(style="margin:14px 0"),
           checkboxInput("use_demo", "Use built-in demo data (12 obs + 6 plots)", value=TRUE),
           conditionalPanel("!input.use_demo",
             tags$div(
@@ -494,7 +1042,7 @@ ui <- navbarPage(
               )
             )
           ),
-          tags$hr(style="margin:8px 0"),
+          tags$hr(style="margin:14px 0"),
           uiOutput("primary_file_ui"),
           uiOutput("join_key_ui"),
           tags$br(),
@@ -518,8 +1066,10 @@ ui <- navbarPage(
         tags$div(class="bl-card",
           tags$span(class="step-badge", "2"),
           tags$strong("Review and adjust field mappings"),
-          tags$span(style="color:#555; font-size:0.9em; margin-left:8px;",
-            "Edit any cell in the table below, then click Apply."),
+          tags$div(style="color:#4f6272; font-size:0.9em; margin-top:6px;",
+            "Choose mappings from the dropdowns for approved Darwin Core and BIEN fields.",
+            tags$br(),
+            "Do not type or invent Darwin Core/BIEN field strings. Leave a mapping blank to skip that source column, then click Apply Mapping."),
           tags$br(), tags$br(),
           actionButton("btn_apply_mapping", "Apply Mapping \u25b6", class="btn-primary"),
           tags$span(style="margin-left:12px;"),
@@ -535,82 +1085,90 @@ ui <- navbarPage(
     uiOutput("tab3_gating"),
     fluidRow(
       column(4,
-        tags$div(class="bl-card",
+        tags$div(class="bl-card stage-summary-card",
           tags$span(class="step-badge", "3"),
-          tags$strong("QC Summary")
+          tags$strong("QC Summary"),
+          uiOutput("qc_summary_ui")
         ),
-        uiOutput("qc_summary_ui"),
-        tags$br(),
-        tags$div(class="bl-card bl-card-warn",
-          tags$strong("BIEN Web Services (Required for BIEN Schema Mapping)"),
-          tags$p(style="font-size:0.85em; margin:4px 0 6px;",
-            "Run these services sequentially for BIEN-schema-ready outputs: TNRS -> GNRS -> GVS -> NSR. These steps populate and standardize BIEN fields and should be completed before final export to the BIEN staging table."),
-          tags$p(style="font-size:0.8em; color:#7f8c8d; margin:0 0 8px;",
-            HTML("<strong>Cloud timeout warning:</strong> Download the validation scripts below and run them locally in R when possible. ",
-                 "The in-app buttons contact external servers that may be unreachable from cloud hosting ",
-                 "(shinyapps.io runs on AWS; external APIs may block cloud IPs). ",
-                 "If an in-app check times out after ~25s, the local script is the reliable path. ",
-                 "For BIEN schema mapping, complete TNRS -> GNRS -> GVS -> NSR before final export.")),
-
-          tags$hr(style="margin:6px 0;"),
-          downloadButton("dl_tnrs_script", "\u2b07 Download TNRS validation script (.R)",
-                         class="btn-success btn-sm",
-                         style="width:100%; margin-bottom:6px; font-size:0.85em;"),
-          actionButton("btn_tnrs", "Try TNRS in app (may timeout from cloud)", class="btn-warning btn-sm",
-                       style="width:100%; margin-bottom:4px;"),
-          fileInput("upload_tnrs", "Upload TNRS results CSV",
-            accept=".csv", buttonLabel="Browse", placeholder="tnrs_results.csv",
-            width="100%"),
-          uiOutput("tnrs_status_ui"),
-          tags$p(style="font-size:0.8em; color:#555; margin:4px 0 8px;",
-            "TNRS matches submitted scientific names to accepted names (WCVP/WFO), standardizes spelling/authorship where possible, and writes scrubbed taxonomy fields."),
-          tags$hr(style="margin:6px 0;"),
-          downloadButton("dl_gnrs_script", "\u2b07 Download GNRS validation script (.R)",
-                         class="btn-success btn-sm",
-                         style="width:100%; margin-bottom:6px; font-size:0.85em;"),
-          actionButton("btn_gnrs", "Try GNRS in app (may timeout from cloud)", class="btn-warning btn-sm",
-                       style="width:100%; margin-bottom:4px;"),
-          fileInput("upload_gnrs", "Upload GNRS results CSV",
-            accept=".csv", buttonLabel="Browse", placeholder="gnrs_results.csv",
-            width="100%"),
-          uiOutput("gnrs_status_ui"),
-          tags$p(style="font-size:0.8em; color:#555; margin:4px 0 8px;",
-            "GNRS standardizes political geography (country/state/county) and helps catch misspellings and inconsistent region strings."),
-          tags$hr(style="margin:6px 0;"),
-          downloadButton("dl_gvs_script", "\u2b07 Download GVS validation script (.R)",
-                         class="btn-success btn-sm",
-                         style="width:100%; margin-bottom:6px; font-size:0.85em;"),
-          actionButton("btn_gvs", "Try GVS in app (may timeout from cloud)", class="btn-warning btn-sm",
-                       style="width:100%; margin-bottom:4px;"),
-          fileInput("upload_gvs", "Upload GVS results CSV",
-            accept=".csv", buttonLabel="Browse", placeholder="gvs_results.csv",
-            width="100%"),
-          uiOutput("gvs_status_ui"),
-          tags$p(style="font-size:0.8em; color:#555; margin:4px 0 8px;",
-            "GVS checks whether lat/lon appear to be political centroids and flags potential georeferencing precision issues; it does not delete records."),
-          tags$hr(style="margin:6px 0;"),
-          downloadButton("dl_nsr_script", "\u2b07 Download NSR validation script (.R)",
-                         class="btn-success btn-sm",
-                         style="width:100%; margin-bottom:6px; font-size:0.85em;"),
-          actionButton("btn_nsr", "Try NSR in app (may timeout from cloud)", class="btn-warning btn-sm",
-                       style="width:100%; margin-bottom:4px;"),
-          fileInput("upload_nsr", "Upload NSR results CSV",
-            accept=".csv", buttonLabel="Browse", placeholder="nsr_results.csv",
-            width="100%"),
-          uiOutput("nsr_status_ui"),
-          tags$p(style="font-size:0.8em; color:#555; margin:4px 0 0;",
-            "NSR estimates native/introduced/cultivated status by taxon plus region, useful for filtering non-native or cultivated observations in downstream analyses.")
+        tags$div(class="bl-card bl-card-warn stage-services-card",
+          tags$strong("BIEN Web Services"),
+          tags$p(class="help-text", style="margin:6px 0 12px;",
+            "Run sequentially for BIEN-schema-ready outputs. ",
+            tags$strong("Click the orange button"), " on each step to run in app, or ",
+            tags$strong("download the local script"), " if cloud times out."),
+          tags$div(class="service-stepper",
+            tabsetPanel(id="service_tabs", type="pills",
+              tabPanel("1 \u00b7 TNRS",
+                tags$div(class="service-panel",
+                  tags$p(class="help-text service-desc",
+                    "Match submitted scientific names to accepted names (WCVP/WFO); standardize spelling/authorship; write scrubbed taxonomy fields."),
+                  actionButton("btn_tnrs", "Try TNRS in app",
+                    class="btn-warning btn-block service-cta"),
+                  downloadButton("dl_tnrs_script", "\u2b07 Download TNRS script (.R)",
+                    class="btn-default btn-block service-dl"),
+                  fileInput("upload_tnrs", "Upload TNRS results CSV",
+                    accept=".csv", buttonLabel="Browse", placeholder="tnrs_results.csv",
+                    width="100%"),
+                  uiOutput("tnrs_status_ui")
+                )
+              ),
+              tabPanel("2 \u00b7 GNRS",
+                tags$div(class="service-panel",
+                  tags$p(class="help-text service-desc",
+                    "Standardize political geography (country/state/county); catch misspellings and inconsistent region strings."),
+                  actionButton("btn_gnrs", "Try GNRS in app",
+                    class="btn-warning btn-block service-cta"),
+                  downloadButton("dl_gnrs_script", "\u2b07 Download GNRS script (.R)",
+                    class="btn-default btn-block service-dl"),
+                  fileInput("upload_gnrs", "Upload GNRS results CSV",
+                    accept=".csv", buttonLabel="Browse", placeholder="gnrs_results.csv",
+                    width="100%"),
+                  uiOutput("gnrs_status_ui")
+                )
+              ),
+              tabPanel("3 \u00b7 GVS",
+                tags$div(class="service-panel",
+                  tags$p(class="help-text service-desc",
+                    "Check whether lat/lon appear to be political centroids; flag georeferencing-precision issues (non-destructive)."),
+                  actionButton("btn_gvs", "Try GVS in app",
+                    class="btn-warning btn-block service-cta"),
+                  downloadButton("dl_gvs_script", "\u2b07 Download GVS script (.R)",
+                    class="btn-default btn-block service-dl"),
+                  fileInput("upload_gvs", "Upload GVS results CSV",
+                    accept=".csv", buttonLabel="Browse", placeholder="gvs_results.csv",
+                    width="100%"),
+                  uiOutput("gvs_status_ui")
+                )
+              ),
+              tabPanel("4 \u00b7 NSR",
+                tags$div(class="service-panel",
+                  tags$p(class="help-text service-desc",
+                    "Estimate native/introduced/cultivated status by taxon + region for downstream filtering."),
+                  actionButton("btn_nsr", "Try NSR in app",
+                    class="btn-warning btn-block service-cta"),
+                  downloadButton("dl_nsr_script", "\u2b07 Download NSR script (.R)",
+                    class="btn-default btn-block service-dl"),
+                  fileInput("upload_nsr", "Upload NSR results CSV",
+                    accept=".csv", buttonLabel="Browse", placeholder="nsr_results.csv",
+                    width="100%"),
+                  uiOutput("nsr_status_ui")
+                )
+              )
+            )
+          )
         )
       ),
       column(8,
-        tabsetPanel(id="stage_tabs",
-          tabPanel("Staging Table",  DT::dataTableOutput("staged_table")),
-          tabPanel("DWC (Darwin Core) Table", DT::dataTableOutput("dwc_table")),
-          tabPanel("QC Details",     DT::dataTableOutput("qc_table")),
-          tabPanel("TNRS Results",   DT::dataTableOutput("tnrs_table")),
-          tabPanel("GNRS Results",   DT::dataTableOutput("gnrs_table")),
-          tabPanel("GVS Results",    DT::dataTableOutput("gvs_table")),
-          tabPanel("NSR Results",    DT::dataTableOutput("nsr_table"))
+        tags$div(class="stage-tabs-wrap",
+          tabsetPanel(id="stage_tabs",
+            tabPanel("Staging",     DT::dataTableOutput("staged_table")),
+            tabPanel("Darwin Core", DT::dataTableOutput("dwc_table")),
+            tabPanel("QC",          DT::dataTableOutput("qc_table")),
+            tabPanel("TNRS",        DT::dataTableOutput("tnrs_table")),
+            tabPanel("GNRS",        DT::dataTableOutput("gnrs_table")),
+            tabPanel("GVS",         DT::dataTableOutput("gvs_table")),
+            tabPanel("NSR",         DT::dataTableOutput("nsr_table"))
+          )
         )
       )
     )
@@ -624,7 +1182,7 @@ ui <- navbarPage(
         tags$div(class="bl-card",
           tags$span(class="step-badge", "4"),
           tags$strong("Download Outputs"),
-          tags$hr(style="margin:8px 0"),
+          tags$hr(style="margin:14px 0"),
           downloadButton("dl_staged",  "BIEN Staging Table (.csv)",
                          style="width:100%; margin-bottom:8px;"),
           downloadButton("dl_dwc",     "Darwin Core Table (.csv)",
@@ -642,7 +1200,7 @@ ui <- navbarPage(
       column(8,
         tags$div(class="bl-card",
           tags$strong("Export Summary"),
-          tags$hr(style="margin:8px 0"),
+          tags$hr(style="margin:14px 0"),
           verbatimTextOutput("export_summary")
         )
       )
@@ -667,9 +1225,8 @@ ui <- navbarPage(
         tags$hr(style = "border-color:#d0dce8; margin-bottom:28px;"),
 
         # CSV File Format
-        tags$h3("CSV File Format",
-          style = "font-size:1.1rem; font-weight:600; color:#2f6fab; margin-bottom:12px;"),
-        tags$p(style = "font-size:0.9rem; color:#555; margin-bottom:12px;",
+        tags$h3("CSV File Format"),
+        tags$p(class="help-text", style="margin-bottom:14px;",
           "The app accepts one or two CSV files. Only one file is required. Each file should
            have column headers in the first row."),
 
@@ -678,10 +1235,10 @@ ui <- navbarPage(
             tags$div(class = "bl-card", style = "margin-bottom:16px;",
               tags$strong("File 1 \u2014 Observation Records (required)",
                 style = "font-size:0.93rem; color:#1a1a2e;"),
-              tags$p(style = "margin:8px 0 6px 0; font-size:0.88rem; color:#3a3a3a; line-height:1.6;",
+              tags$p(style = "margin:10px 0;",
                 "One row per observation. Must include at minimum a species name column.
                  Any other columns are optional but will be auto-mapped if recognized."),
-              tags$p(style = "margin:4px 0 4px 0; font-size:0.82rem; color:#555;",
+              tags$p(class="help-text", style="margin:6px 0;",
                 tags$strong("Example columns:")),
               tags$ul(
                 style = "margin:0; padding-left:18px; font-size:0.83rem; color:#3a3a3a; line-height:1.9;",
@@ -704,11 +1261,11 @@ ui <- navbarPage(
             tags$div(class = "bl-card", style = "margin-bottom:16px;",
               tags$strong("File 2 \u2014 Metadata or Plot Data (optional)",
                 style = "font-size:0.93rem; color:#1a1a2e;"),
-              tags$p(style = "margin:8px 0 6px 0; font-size:0.88rem; color:#3a3a3a; line-height:1.6;",
+              tags$p(style = "margin:10px 0;",
                 "Any supplementary table you want joined to the observation records \u2014
                  plot metadata, site attributes, survey details, etc. The two files are
                  joined on a shared key column you select."),
-              tags$p(style = "margin:4px 0 4px 0; font-size:0.82rem; color:#555;",
+              tags$p(class="help-text", style="margin:6px 0;",
                 tags$strong("Example use cases:")),
               tags$ul(
                 style = "margin:0; padding-left:18px; font-size:0.83rem; color:#3a3a3a; line-height:1.9;",
@@ -745,8 +1302,7 @@ ui <- navbarPage(
         tags$hr(style = "border-color:#d0dce8; margin-bottom:24px;"),
 
         # What This App Does
-        tags$h3("What This App Does",
-          style = "font-size:1.1rem; font-weight:600; color:#2f6fab; margin-bottom:12px;"),
+        tags$h3("What This App Does"),
         tags$div(class = "bl-card", style = "margin-bottom:24px;",
           tags$p(style = "margin:0; font-size:0.93rem; line-height:1.65; color:#2c2c2c;",
             "Upload one or two CSV files of field observation records, map your column names
@@ -757,8 +1313,7 @@ ui <- navbarPage(
         ),
 
         # Four-Step Workflow
-        tags$h3("Four-Step Workflow",
-          style = "font-size:1.1rem; font-weight:600; color:#2f6fab; margin-bottom:16px;"),
+        tags$h3("Four-Step Workflow"),
         fluidRow(
           column(6,
             tags$div(class = "bl-card", style = "margin-bottom:16px; min-height:110px;",
@@ -816,8 +1371,7 @@ ui <- navbarPage(
         tags$hr(style = "border-color:#d0dce8; margin:8px 0 24px 0;"),
 
         # Scientific Caveats
-        tags$h3("Scientific Caveats",
-          style = "font-size:1.1rem; font-weight:600; color:#8a6000; margin-bottom:12px;"),
+        tags$h3("Scientific Caveats"),
         tags$div(class = "bl-card-warn", style = "margin-bottom:24px;",
           tags$ul(
             style = "margin:0; padding-left:20px; font-size:0.88rem; line-height:1.8; color:#3a2800;",
@@ -859,8 +1413,7 @@ ui <- navbarPage(
         ),
 
         # Technical Notes
-        tags$h3("Technical Notes",
-          style = "font-size:1.1rem; font-weight:600; color:#2f6fab; margin-bottom:12px;"),
+        tags$h3("Technical Notes"),
         tags$div(
           style = "background:#f4f6f8; border-radius:6px; padding:16px 20px; margin-bottom:24px;",
           tags$ul(
@@ -894,9 +1447,18 @@ ui <- navbarPage(
 
         tags$hr(style = "border-color:#d0dce8; margin-bottom:24px;"),
 
+        # ── BIEN Staging Field Reference ──────────────────────────────────────
+        tags$h3("BIEN Staging Field Reference"),
+        tags$p(class="help-text", style="margin-bottom:12px;",
+          "All recognized BIEN staging fields, their data category, and a plain-language definition.
+           Search or scroll to find any field. This table drives the auto-mapping in Tab 2."),
+        DT::dataTableOutput("help_field_ref"),
+        tags$br(),
+
+        tags$hr(style = "border-color:#d0dce8; margin-bottom:24px;"),
+
         # About / Credits
-        tags$h3("About",
-          style = "font-size:1.1rem; font-weight:600; color:#2f6fab; margin-bottom:12px;"),
+        tags$h3("About"),
         tags$div(class = "bl-card", style = "margin-bottom:40px;",
           tags$p(style = "margin:0 0 8px 0; font-size:0.9rem; line-height:1.65; color:#2c2c2c;",
             "Built for the ",
@@ -938,7 +1500,9 @@ server <- function(input, output, session) {
     gnrs_result  = NULL,
     gvs_result   = NULL,
     nsr_result   = NULL,
-    completion_modal_shown = FALSE
+    completion_modal_shown = FALSE,
+    tab3_intro_seen = FALSE,
+    svc_seen = list(tnrs = FALSE, gnrs = FALSE, gvs = FALSE, nsr = FALSE)
   )
 
   # ── Resolve demo data path reliably regardless of working directory ──────────
@@ -953,6 +1517,29 @@ server <- function(input, output, session) {
       if (file.exists(p)) return(p)
     }
     NULL
+  }
+
+  approved_mapping_choices <- list(
+    dwc = c("", DWC_TERMS),
+    bien = c("", BIEN_STAGING_FIELDS)
+  )
+
+  build_mapping_select_html <- function(selected, choices, select_class, row_idx) {
+    selected_val <- if (is.null(selected) || is.na(selected)) "" else as.character(selected)
+    option_tags <- vapply(choices, function(choice) {
+      label <- if (nzchar(choice)) choice else " "
+      paste0(
+        "<option value=\"", htmltools::htmlEscape(choice), "\"",
+        if (identical(choice, selected_val)) " selected" else "",
+        ">", htmltools::htmlEscape(label), "</option>"
+      )
+    }, character(1))
+    paste0(
+      "<select class='form-control input-sm ", select_class, "' data-row='", row_idx,
+      "' style='min-width:220px;'>",
+      paste(option_tags, collapse = ""),
+      "</select>"
+    )
   }
 
   # ── Load raw files whenever source changes (for column detection only) ──────
@@ -977,26 +1564,66 @@ server <- function(input, output, session) {
         "plot_metadata.csv" = read.csv(meta_path, stringsAsFactors=FALSE, check.names=FALSE)
       )
       # Strip completely blank rows from demo data
-      rv$raw_files <- lapply(rv$raw_files, function(df) {
-        df[rowSums(!is.na(df) & trimws(as.matrix(df)) != "") > 0, , drop=FALSE]
-      })
+      rv$raw_files <- lapply(rv$raw_files, blank_row_filter)
     } else if (!is.null(input$files)) {
+      too_large <- input$files$name[input$files$size > 100 * 1024 * 1024]
+      if (length(too_large) > 0) {
+        rv$raw_files <- NULL
+        showNotification(
+          paste0(
+            "Upload rejected: file(s) exceed app maximum upload size (100 MB): ",
+            paste(too_large, collapse = ", "),
+            "."
+          ),
+          type = "error", duration = 12
+        )
+        return()
+      }
+
+      total_bytes <- sum(input$files$size)
+      if (total_bytes > 200 * 1024^2) {
+        rv$raw_files <- NULL
+        showNotification(
+          paste0("Upload rejected: combined size (", round(total_bytes / 1024^2, 1),
+                 " MB) exceeds the 200 MB aggregate limit. Upload fewer or smaller files."),
+          type = "error", duration = 12
+        )
+        return()
+      }
+
       # Basic file size guard: warn if any file > 50 MB
       large <- input$files$name[input$files$size > 50 * 1024 * 1024]
       if (length(large) > 0) {
         showNotification(paste0("Large file(s) detected (> 50 MB): ",
-          paste(large, collapse=", "), ". Loading may be slow."),
+          paste(large, collapse=", "), ". Loading may be slow. App upload limit is 100 MB per file."),
           type="warning", duration=10)
       }
-      rv$raw_files <- setNames(
-        lapply(input$files$datapath,
-               function(p) {
-                 df <- read.csv(p, stringsAsFactors=FALSE, check.names=FALSE)
-                 # Strip completely blank rows (e.g. trailing empty line in CSV)
-                 df[rowSums(!is.na(df) & trimws(as.matrix(df)) != "") > 0, , drop=FALSE]
-               }),
-        input$files$name
+
+      loaded <- tryCatch(
+        {
+          setNames(
+            lapply(seq_along(input$files$datapath), function(i) {
+              p <- input$files$datapath[[i]]
+              n <- input$files$name[[i]]
+              df <- safe_read_csv_with_fallbacks(p, file_label = n)
+              blank_row_filter(df)
+            }),
+            input$files$name
+          )
+        },
+        error = function(e) e
       )
+
+      if (inherits(loaded, "error")) {
+        rv$raw_files <- NULL
+        showNotification(
+          paste0("Upload failed. Please check CSV delimiter/encoding and retry. ", conditionMessage(loaded)),
+          type = "error", duration = 12
+        )
+        return()
+      }
+
+      rv$raw_files <- loaded
     }
   })
 
@@ -1077,6 +1704,17 @@ server <- function(input, output, session) {
       rv$tnrs_result   <- NULL
       rv$gnrs_result   <- NULL
       rv$gvs_result    <- NULL
+
+      showModal(modalDialog(
+        title = "Step 1 complete",
+        tags$p("Your dataset is prepared."),
+        tags$p("Why this matters: mapping each source column to approved Darwin Core and BIEN fields ensures a valid schema and reliable staging outputs."),
+        easyClose = TRUE,
+        footer = tagList(
+          actionButton("btn_go_map", "Go to 2 \u2022 Map Fields \u2192", class = "btn btn-primary"),
+          modalButton("Close")
+        )
+      ))
       rv$nsr_result    <- NULL
     }, error = function(e) {
       showNotification(
@@ -1094,7 +1732,10 @@ server <- function(input, output, session) {
       tags$br(),
       paste0(nrow(rv$merged), " rows \u00d7 ", ncol(rv$merged), " columns"),
       tags$br(),
-      paste0("Files: ", paste(names(rv$raw_files), collapse=", "))
+      paste0("Files: ", paste(names(rv$raw_files), collapse=", ")),
+      tags$hr(style="margin:8px 0;"),
+      tags$span(style="color:#36556e;",
+        "Next: Click '2 \u2022 Map Fields' to confirm how your source columns map to approved Darwin Core and BIEN fields before staging.")
     )
   })
 
@@ -1120,28 +1761,90 @@ server <- function(input, output, session) {
     }
   })
 
-  # ── Step 2: Mapping table (editable DT) ───────────────────────────────────
-  output$mapping_table <- DT::renderDataTable({
-    req(rv$mapping_draft)
+  # ── Help tab: Field Reference table ───────────────────────────────────────
+  output$help_field_ref <- DT::renderDataTable({
+    flds <- names(BIEN_FIELD_DEFS)
+    df <- data.frame(
+      Field      = flds,
+      Category   = unname(BIEN_FIELD_CATEGORY[flds]),
+      Definition = unname(BIEN_FIELD_DEFS[flds]),
+      stringsAsFactors = FALSE
+    )
     DT::datatable(
-      rv$mapping_draft,
-      editable = list(target="cell", disable=list(columns=0L)),
+      df,
       rownames = FALSE,
-      colnames = c("Source Column", "Suggested DWC Term", "Suggested BIEN Field"),
-      options  = list(pageLength=30, scrollX=TRUE, dom='frtip'),
-      caption  = "Edit 'Suggested DWC Term' or 'Suggested BIEN Field' cells directly (Source Column is locked), then click Apply Mapping."
+      colnames = c("BIEN Field", "Category", "Definition"),
+      options  = list(pageLength=15, scrollX=TRUE, dom='frtip',
+        columnDefs=list(list(width='180px', targets=0),
+                        list(width='120px', targets=1),
+                        list(className='dt-wrap', targets=2))),
+      class    = "stripe hover compact"
     )
   }, server=FALSE)
 
-  observeEvent(input$mapping_table_cell_edit, {
-    info <- input$mapping_table_cell_edit
-    df   <- rv$mapping_draft
-    # DT 0-indexed col: +1 for R 1-indexed, but rownames=FALSE means col 0 = source_col (col 1 in df)
-    col_idx <- info$col + 1L
-    if (col_idx >= 1L && col_idx <= ncol(df)) {
-      df[info$row, col_idx] <- info$value
-      rv$mapping_draft <- df
-    }
+  # ── Step 2: Mapping table (editable DT) ───────────────────────────────────
+  output$mapping_table <- DT::renderDataTable({
+    req(rv$mapping_draft)
+    mapping_view <- rv$mapping_draft
+    mapping_view$dwc_term <- vapply(seq_len(nrow(mapping_view)), function(i) {
+      build_mapping_select_html(
+        selected = mapping_view$dwc_term[i],
+        choices = approved_mapping_choices$dwc,
+        select_class = "map-dwc",
+        row_idx = i
+      )
+    }, character(1))
+    mapping_view$bien_field <- vapply(seq_len(nrow(mapping_view)), function(i) {
+      build_mapping_select_html(
+        selected = mapping_view$bien_field[i],
+        choices = approved_mapping_choices$bien,
+        select_class = "map-bien",
+        row_idx = i
+      )
+    }, character(1))
+    DT::datatable(
+      mapping_view,
+      editable = FALSE,
+      escape = FALSE,
+      rownames = FALSE,
+      colnames = c("Source Column", "Suggested DWC Term", "Suggested BIEN Field"),
+      options  = list(pageLength=30, scrollX=TRUE, dom='frtip'),
+      caption  = "Use dropdowns only: choose approved Darwin Core and BIEN fields (or leave blank). Do not type or invent BIEN/Darwin field strings. Then click Apply Mapping.",
+      callback = DT::JS(
+        "table.on('change', 'select.map-dwc', function() {",
+        "  var row = $(this).data('row');",
+        "  Shiny.setInputValue('mapping_dwc_change', {row: row, value: this.value, nonce: Math.random()}, {priority: 'event'});",
+        "});",
+        "table.on('change', 'select.map-bien', function() {",
+        "  var row = $(this).data('row');",
+        "  Shiny.setInputValue('mapping_bien_change', {row: row, value: this.value, nonce: Math.random()}, {priority: 'event'});",
+        "});"
+      )
+    )
+  }, server=FALSE)
+
+  observeEvent(input$mapping_dwc_change, {
+    req(rv$mapping_draft)
+    info <- input$mapping_dwc_change
+    row_idx <- suppressWarnings(as.integer(info$row))
+    if (is.na(row_idx) || row_idx < 1 || row_idx > nrow(rv$mapping_draft)) return()
+    val <- if (is.null(info$value)) "" else as.character(info$value)
+    if (!(val %in% approved_mapping_choices$dwc)) return()
+    df <- rv$mapping_draft
+    df$dwc_term[row_idx] <- if (nzchar(val)) val else NA_character_
+    rv$mapping_draft <- df
+  })
+
+  observeEvent(input$mapping_bien_change, {
+    req(rv$mapping_draft)
+    info <- input$mapping_bien_change
+    row_idx <- suppressWarnings(as.integer(info$row))
+    if (is.na(row_idx) || row_idx < 1 || row_idx > nrow(rv$mapping_draft)) return()
+    val <- if (is.null(info$value)) "" else as.character(info$value)
+    if (!(val %in% approved_mapping_choices$bien)) return()
+    df <- rv$mapping_draft
+    df$bien_field[row_idx] <- if (nzchar(val)) val else NA_character_
+    rv$mapping_draft <- df
   })
 
   observeEvent(input$btn_apply_mapping, {
@@ -1174,14 +1877,91 @@ server <- function(input, output, session) {
         )
       })
     }
+
+    if (!is.null(rv$mapping) && !is.null(rv$staged)) {
+      showModal(modalDialog(
+        title = "Step 2 complete",
+        "Mapping has been applied.",
+        tags$p("Reason: this mapping created BIEN staging and Darwin Core outputs for review before export."),
+        easyClose = TRUE,
+        footer = tagList(
+          actionButton("btn_go_stage", "Go to 3 \u2022 Stage & Validate \u2192", class = "btn btn-primary"),
+          modalButton("Close")
+        )
+      ))
+    }
   })
+
+  observeEvent(input$btn_go_map, {
+    removeModal()
+    updateNavbarPage(session, "tabs", selected = "2 \u2022 Map Fields")
+  })
+
+  observeEvent(input$btn_go_stage, {
+    removeModal()
+    updateNavbarPage(session, "tabs", selected = "3 \u2022 Stage & Validate")
+  })
+
+  # ── Tab 3 one-shot guidance modals ────────────────────────────────────────
+  observeEvent(input$tabs, {
+    if (identical(input$tabs, "3 \u2022 Stage & Validate") && isFALSE(rv$tab3_intro_seen)) {
+      rv$tab3_intro_seen <- TRUE
+      # Pre-mark TNRS pill as seen so the intro modal isn't immediately overwritten
+      # by the per-service nudge when service_tabs emits its initial value.
+      rv$svc_seen$tnrs <- TRUE
+      showModal(modalDialog(
+        title = tags$div(tags$span(class="step-badge", "3"), "Stage & Validate \u2014 BIEN web services walkthrough"),
+        tags$p("Run the four BIEN web services in order: ",
+               tags$strong("TNRS \u2192 GNRS \u2192 GVS \u2192 NSR"),
+               ". Each service standardizes a part of your record so it lines up with the BIEN schema."),
+        tags$ul(
+          tags$li(tags$strong("TNRS"), " \u2014 accepted scientific names"),
+          tags$li(tags$strong("GNRS"), " \u2014 standardized country/state/county"),
+          tags$li(tags$strong("GVS"),  " \u2014 coordinate centroid check"),
+          tags$li(tags$strong("NSR"),  " \u2014 native / introduced / cultivated status")
+        ),
+        tags$p("Use the orange ", tags$strong("Try in app"), " button on each step. ",
+               "If the cloud times out, download the local R script for that step instead."),
+        easyClose = TRUE,
+        footer = modalButton("Start with TNRS")
+      ))
+    }
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$service_tabs, {
+    svc_label <- input$service_tabs
+    svc_key <- if (grepl("TNRS", svc_label)) "tnrs"
+               else if (grepl("GNRS", svc_label)) "gnrs"
+               else if (grepl("GVS",  svc_label)) "gvs"
+               else if (grepl("NSR",  svc_label)) "nsr"
+               else NA_character_
+    if (is.na(svc_key)) return()
+    if (isTRUE(rv$svc_seen[[svc_key]])) return()
+    rv$svc_seen[[svc_key]] <- TRUE
+    title_map <- c(tnrs="TNRS \u2014 Taxonomic Name Resolution",
+                   gnrs="GNRS \u2014 Geographic Name Resolution",
+                   gvs ="GVS \u2014 Geographic Validation",
+                   nsr ="NSR \u2014 Native Status Resolver")
+    next_map <- c(tnrs="Next: GNRS", gnrs="Next: GVS",
+                  gvs ="Next: NSR",  nsr ="Next: 4 \u2022 Export")
+    showModal(modalDialog(
+      title = title_map[[svc_key]],
+      tags$p("Click the ", tags$strong("orange button"),
+             " above to run this service. If the cloud version times out, ",
+             "use the download-script + upload-CSV path instead."),
+      tags$p(class="help-text", "When status reads ",
+             tags$em("Complete"), " or you have uploaded a results CSV, advance to the next step."),
+      easyClose = TRUE,
+      footer = modalButton(next_map[[svc_key]])
+    ))
+  }, ignoreInit = TRUE)
 
   output$step2_status_inline <- renderUI({
     if (is.null(rv$mapping)) return(NULL)
     n_dwc  <- sum(!is.na(rv$mapping$dwc_term) & nzchar(trimws(rv$mapping$dwc_term)))
     n_bien <- sum(!is.na(rv$mapping$bien_field) & nzchar(trimws(rv$mapping$bien_field)))
     tags$span(style="color:#27ae60; font-weight:600;",
-      paste0("Mapping applied \u2014 ", n_dwc, " DWC terms, ", n_bien, " BIEN fields mapped"))
+      paste0("Mapping applied \u2014 ", n_dwc, " DWC terms, ", n_bien, " BIEN fields mapped. Next: open '3 \u2022 Stage & Validate'."))
   })
 
   # ── Tab 3 gating ─────────────────────────────────────────────────────────
@@ -1190,6 +1970,10 @@ server <- function(input, output, session) {
       tags$div(class="bl-card bl-card-warn",
         tags$strong("Complete Step 2 first: "),
         "Go to \u20182 \u2022 Map Fields\u2019 and click Apply Mapping.")
+    } else {
+      tags$div(class="bl-card",
+        tags$strong("Next in Step 3: "),
+        "Review the staging table and QC details here, then continue to '4 \u2022 Export' when everything looks correct.")
     }
   })
 
@@ -1206,7 +1990,7 @@ server <- function(input, output, session) {
     card_cls <- if (n_block > 0) "bl-card bl-card-block" else
                 if (n_warn  > 0) "bl-card bl-card-warn"  else "bl-card bl-card-pass"
 
-    verdict <- if (n_block > 0) "Export blocked \u2014 fix BLOCK issues" else
+    verdict <- if (n_block > 0) "Export caution \u2014 review BLOCK issues" else
                if (n_warn  > 0) "Ready with warnings" else "All checks passed"
 
     tags$div(class=card_cls,
@@ -1331,9 +2115,10 @@ server <- function(input, output, session) {
           "Name_submitted" %in% names(rv$tnrs_result)) {
         tnrs <- rv$tnrs_result
         stg  <- rv$staged
+        stg_names_key <- trimws(stg$scrubbed_species_binomial)
         for (i in seq_len(nrow(tnrs))) {
           submitted <- tnrs$Name_submitted[i]
-          rows <- which(trimws(stg$scrubbed_species_binomial) == trimws(submitted))
+          rows <- which(stg_names_key == trimws(submitted))
           if (length(rows) == 0) next
           # Accepted name (prefer Accepted_name, fall back to Name_matched)
           acc <- NA_character_
@@ -1901,7 +2686,9 @@ server <- function(input, output, session) {
       tags$div(class = "bl-card bl-card-pass", style = "margin-bottom:12px;",
         tags$p(style = "margin:0; font-size:0.9rem; color:#1a5c35;",
           tags$strong("The BIEN Staging Table is ready for export."),
-          " It contains the original columns alongside reconciled BIEN schema fields.")
+          " It contains the original columns alongside reconciled BIEN schema fields."),
+        tags$p(style = "margin:8px 0 0 0; font-size:0.86rem; color:#1a5c35;",
+          "After review, click 'Go to Export (Tab 4) \u2192' to continue.")
       ),
 
       # Science review reminder
@@ -2004,23 +2791,30 @@ server <- function(input, output, session) {
   # ── TNRS upload-back ──────────────────────────────────────────────────────
   observeEvent(input$upload_tnrs, {
     req(input$upload_tnrs)
+    if (input$upload_tnrs$size > 20 * 1024^2) {
+      showNotification("Upload rejected: TNRS results file exceeds 20 MB. Confirm you selected the correct results CSV.", type = "error", duration = 10)
+      return()
+    }
     if (is.null(rv$staged)) {
       showNotification("No staging table — complete Steps 1-3 before uploading TNRS results.",
                        type="error", duration=10)
       return()
     }
     tryCatch({
-      df <- utils::read.csv(input$upload_tnrs$datapath, stringsAsFactors=FALSE,
-                            check.names=FALSE)
+      df <- safe_read_csv_with_fallbacks(
+        input$upload_tnrs$datapath,
+        file_label = input$upload_tnrs$name
+      )
       if (nrow(df) == 0) stop("Uploaded CSV has no rows.")
       rv$tnrs_result <- df
 
       if ("Name_submitted" %in% names(df) && !"note" %in% names(df)) {
         tnrs <- df
         stg  <- rv$staged
+        stg_names_key <- trimws(stg$scrubbed_species_binomial)
         for (i in seq_len(nrow(tnrs))) {
           submitted <- tnrs$Name_submitted[i]
-          rows <- which(trimws(stg$scrubbed_species_binomial) == trimws(submitted))
+          rows <- which(stg_names_key == trimws(submitted))
           if (length(rows) == 0) next
           for (col in c("Accepted_name","Name_matched")) {
             if (col %in% names(tnrs) && !is.na(tnrs[[col]][i]) && nzchar(trimws(tnrs[[col]][i]))) {
@@ -2065,14 +2859,20 @@ server <- function(input, output, session) {
   # ── GNRS upload-back ──────────────────────────────────────────────────────
   observeEvent(input$upload_gnrs, {
     req(input$upload_gnrs)
+    if (input$upload_gnrs$size > 20 * 1024^2) {
+      showNotification("Upload rejected: GNRS results file exceeds 20 MB. Confirm you selected the correct results CSV.", type = "error", duration = 10)
+      return()
+    }
     if (is.null(rv$staged)) {
       showNotification("No staging table — complete Steps 1-3 before uploading GNRS results.",
                        type="error", duration=10)
       return()
     }
     tryCatch({
-      df <- utils::read.csv(input$upload_gnrs$datapath, stringsAsFactors=FALSE,
-                            check.names=FALSE)
+      df <- safe_read_csv_with_fallbacks(
+        input$upload_gnrs$datapath,
+        file_label = input$upload_gnrs$name
+      )
       if (nrow(df) == 0) stop("Uploaded CSV has no rows.")
       rv$gnrs_result <- df
 
@@ -2120,14 +2920,20 @@ server <- function(input, output, session) {
   # ── GVS upload-back ───────────────────────────────────────────────────────
   observeEvent(input$upload_gvs, {
     req(input$upload_gvs)
+    if (input$upload_gvs$size > 20 * 1024^2) {
+      showNotification("Upload rejected: GVS results file exceeds 20 MB. Confirm you selected the correct results CSV.", type = "error", duration = 10)
+      return()
+    }
     if (is.null(rv$staged)) {
       showNotification("No staging table — complete Steps 1-3 before uploading GVS results.",
                        type="error", duration=10)
       return()
     }
     tryCatch({
-      df <- utils::read.csv(input$upload_gvs$datapath, stringsAsFactors=FALSE,
-                            check.names=FALSE)
+      df <- safe_read_csv_with_fallbacks(
+        input$upload_gvs$datapath,
+        file_label = input$upload_gvs$name
+      )
       if (nrow(df) == 0) stop("Uploaded CSV has no rows.")
       rv$gvs_result <- df
 
@@ -2173,14 +2979,20 @@ server <- function(input, output, session) {
   # ── NSR upload-back ───────────────────────────────────────────────────────
   observeEvent(input$upload_nsr, {
     req(input$upload_nsr)
+    if (input$upload_nsr$size > 20 * 1024^2) {
+      showNotification("Upload rejected: NSR results file exceeds 20 MB. Confirm you selected the correct results CSV.", type = "error", duration = 10)
+      return()
+    }
     if (is.null(rv$staged)) {
       showNotification("No staging table — complete Steps 1-3 before uploading NSR results.",
                        type="error", duration=10)
       return()
     }
     tryCatch({
-      df <- utils::read.csv(input$upload_nsr$datapath, stringsAsFactors=FALSE,
-                            check.names=FALSE)
+      df <- safe_read_csv_with_fallbacks(
+        input$upload_nsr$datapath,
+        file_label = input$upload_nsr$name
+      )
       if (nrow(df) == 0) stop("Uploaded CSV has no rows.")
       rv$nsr_result <- df
 
@@ -2234,115 +3046,6 @@ server <- function(input, output, session) {
       showNotification(paste0("NSR upload failed: ", conditionMessage(e)),
                        type="error", duration=10)
     })
-  })
-
-  # ── Validation-complete modal (fires when all 4 services succeed) ─────────
-  observe({
-    t <- rv$tnrs_result; g <- rv$gnrs_result
-    v <- rv$gvs_result;  n <- rv$nsr_result
-    all_ran <- !is.null(t) && !is.null(g) && !is.null(v) && !is.null(n)
-    all_ok  <- all_ran &&
-      !"note" %in% names(t) &&
-      !"note" %in% names(g) &&
-      !"note" %in% names(v) &&
-      !"note" %in% names(n)
-    if (!all_ok) return()
-
-    showModal(modalDialog(
-      title = tags$span(
-        style = "color:#27ae60; font-size:1.25em; font-weight:700;",
-        "\u2713  BIEN Validation Complete"
-      ),
-
-      # ── Service checklist ──────────────────────────────────────────────────
-      tags$div(class = "bl-card bl-card-pass",
-        style = "margin-bottom:16px;",
-        tags$p(
-          style = "margin:0 0 10px 0; font-weight:600; color:#1a6640;",
-          "All four BIEN web services completed successfully:"
-        ),
-        tags$table(
-          style = "width:100%; border-collapse:collapse; font-size:0.9em;",
-          tags$tr(
-            tags$td(style="padding:4px 10px 4px 0; white-space:nowrap;",
-                    tags$strong("TNRS")),
-            tags$td(style="color:#555;",
-                    "Taxonomic Name Resolution Service — scientific names resolved against WCVP / WFO")
-          ),
-          tags$tr(
-            tags$td(style="padding:4px 10px 4px 0; white-space:nowrap;",
-                    tags$strong("GNRS")),
-            tags$td(style="color:#555;",
-                    "Geographic Name Resolution Service — country, state, and county names standardized")
-          ),
-          tags$tr(
-            tags$td(style="padding:4px 10px 4px 0; white-space:nowrap;",
-                    tags$strong("GVS")),
-            tags$td(style="color:#555;",
-                    "Geographic Validation Service — coordinate centroid precision issues flagged")
-          ),
-          tags$tr(
-            tags$td(style="padding:4px 10px 4px 0; white-space:nowrap;",
-                    tags$strong("NSR")),
-            tags$td(style="color:#555;",
-                    "Native Species Resolver — native, introduced, and cultivated status assigned per region")
-          )
-        )
-      ),
-
-      # ── Staging table ready ────────────────────────────────────────────────
-      tags$div(class = "bl-card bl-card-pass",
-        style = "margin-bottom:16px;",
-        tags$p(
-          style = "margin:0; font-weight:600; color:#1a6640;",
-          "BIEN Staging Table is built and ready to export."
-        )
-      ),
-
-      # ── Review reminder ────────────────────────────────────────────────────
-      tags$div(class = "bl-card bl-card-warn",
-        style = "margin-bottom:4px;",
-        tags$p(
-          style = "margin:0 0 6px 0; font-weight:600;",
-          "\u26a0\ufe0f  Before exporting, review each service\u2019s results tab:"
-        ),
-        tags$ul(
-          style = "margin:0; padding-left:20px; color:#555; font-size:0.9em;",
-          tags$li(
-            tags$strong("TNRS Results:"),
-            " check for ambiguous or low-confidence name matches that may require manual curation."
-          ),
-          tags$li(
-            tags$strong("NSR Results:"),
-            " native / introduced / cultivated interpretations are region-specific and should be ",
-            "reviewed in the context of your collection method and intended use."
-          )
-        )
-      ),
-
-      footer = tagList(
-        actionButton(
-          "modal_go_export",
-          label   = tags$span(
-            tags$strong("Go to Export (Tab 4)"),
-            style = "font-size:0.95em;"
-          ),
-          style   = paste(
-            "background-color:#2f6fab; color:#fff; border:none;",
-            "padding:8px 20px; border-radius:4px; cursor:pointer;"
-          )
-        ),
-        tags$span(style = "display:inline-block; width:8px;"),
-        modalButton("Close")
-      ),
-      easyClose = TRUE,
-      size      = "m"
-    ))
-  }) |> bindEvent(rv$nsr_result, ignoreNULL = TRUE, ignoreInit = TRUE)
-
-  observeEvent(input$modal_go_export, {
-    removeModal()
-    updateNavbarPage(session, "tabs", selected = "4 \u2022 Export")
   })
 
   # ── Tab 4 gating ─────────────────────────────────────────────────────────
